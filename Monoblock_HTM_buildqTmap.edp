@@ -1,0 +1,1488 @@
+/*
+ * SIMPLIFIED MONOBLOCK HEAT TRANSFER MODEL
+ *
+ * changelog:
+ * v. 1:					initial release by S. Carli
+ * v. 1.6:					CPS with Li liquid metal added (with underrelaxation) (15/05/2018)
+ * v. 1.61:					added flags for grid independence study (17/05/2018)
+ * v. 1.618:					material properties redefined as macros (23/05/2018)
+ * v. 1.6180:					pseudo-transient instead of fixed-point (25/05/2018)
+ */
+ 
+//include "getARGV.idp"
+
+//cgfn Important general comment: i calcoli sono svolti in gradi Celsius, pertanto in tutte le formule che richiedono invece i gradi K andra' aggiunto 273.15
+
+// cgfn FIXME aggiungere descrizione della routine nelle sue parti
+//cgfn FIXME assicurarsi che la formulazione per il flusso evaporativo sia coerente con quella usata da SOLPS-ITER;
+//cgfn inoltre passo a SOLPS-ITER la temperatura tale da calcolare lo stesso flusso evaporativo, oppure semplicamente sostituisco thermev.
+//cgfn RMK thermev vuole T in K
+///////////////////////////////////////////////
+//Part 1: Load input data and define geometry//
+///////////////////////////////////////////////
+
+real L,D1,D2,D3,Hw,Ltile,LMth,Tf,mflow,cpw,L1,aalpha,bbeta,ttheta; // (caf 04/05/2018)
+real sss1,sss2,H,alpha,beta,theta,Tgap,Xshadow,TrefLM,alphaCPS,xLM; // (caf 04/05/2018)
+int n,npointout, itrans, itruetrans; // caf add transient flag
+int inout,nplots, iLM, iCPSs; // (caf 04/05/2018)
+string sinout; // sinout="l" for inboard divertor, sinout="r" for outboard divertor
+int iplot=0;
+
+real Na = 6.022e23; // Avogadro constant
+real R0 = 8.314472; // Universal gas constant [J/(mol K)]
+real eta = 1.66; // from J. Safarian, T.A. Engh, Vacuum evaporation of pure metals, Metall. Mater.Trans. A 44 (2013) 747–753 // cgfn in SOLPS it is called sticking coefficient. This must be consistent with the one chosen in SOLPS
+int ITERMAX = 2E5; // maximum number of fixed-point iterations (caf 15/05/2018)
+real dt = 1e-5; // (caf 23/05/2018)
+real time = 0;
+real epsilon=1E-5; //sufficiently small number
+bool dbg = false; // debug flag (caf 04/05/2018)
+bool grid = false; // set to true when performing a grid independence study
+bool autogrid = false; // set to true when performing a script-based grid independence study
+bool timedbg = true; // transient debug flag
+//bool itruetrans=true; //flag for actual transient calculation cgfn provo a fare a meno di questo flag
+grid = grid || autogrid;
+dbg = dbg || grid; //obbligo a fare debug se faccio grid independence
+timedbg = timedbg && dbg;
+int verb = 0; // debug verbosity: 0 --> no debug on standard output; 1 --> print debug messages on standard output; 2 --> print messages and show plots
+if (!dbg || grid)
+{
+	verb = 0;
+	verbosity=0; //cgfn sopprimo anche gli outputs standard di FreeFem++
+}
+verbosity=0; //cgfn FIXME per il momento lo faccio tacere in ogni caso 
+{
+ifstream inputs("mnb_in.dat");
+//FIXME verificare coerenza con la figura inclusa nel manuale, e produrre una ulteriore figura dove si vede cosa cambia nel caso di CPS.
+//FIXME negli input degli angoli ho assunto sempre 0.0 gradi, ipotizzando che il valore fornito da SOLPS tenga gia' conto delle inclinazioni varie. Tuttavia, questa tematica va approfondita. In particolare, il modo in cui viene calcolato ft3dr rispetto a ft3dP va verificato.
+inputs >> L1;			// tile height
+inputs >> L;			// tile toroidal length
+inputs >> sss1;			// Cu interlayer thickness
+inputs >> sss2;			// CuCrZr tube thickness
+inputs >> D3;			// CuCrZr tube internal diameter
+inputs >> LMth;			// CPS thickness (caf 04/05/2018)
+inputs >> Hw;			// W armour thickness (from plasma facing surface to Cu interlayer)
+inputs >> Ltile;		// Tile poloidal length
+inputs >> Tgap;			// Toroidal gap between monoblocks
+inputs >> alpha;		// VT tilting
+inputs >> bbeta;		// Poloidal chamfer
+inputs >> ttheta;		// Toroidal strike angle of magnetic flux lines [degrees]
+inputs >> TrefLM;		// LM reservoir temperature
+inputs >> alphaCPS;		// CPS solid-to-liquid ratio
+inputs >> iLM;			// defines LM: Li (1) or Sn (2)
+inputs >> iCPSs;		// defines CPS mesh material: W (1)
+inputs >> xLM;			// LM refill distribution, (1-xLM) from left, xLM from right
+inputs >> itrans;       // peudotransient (1) vs. steady-state iterative (0) approach for steady state calculation
+inputs >> itruetrans;	// actual transient calculation (coupled with SOLPS-ITER)
+inputs >> dt;			// Timestep [s]
+inputs >> Tf;			// Coolant inlet temperature
+inputs >> mflow;		// Coolant mass flow rate
+inputs >> cpw;			// Coolant specific heat
+inputs >> n;			// # of mesh points on longest edge //n=50 is grid independent
+inputs >> npointout;	// Number of points for output surface temperature
+inputs >> inout;		// defines inboard (1) or outboard (0) divertor
+inputs >> nplots;		// 2D plots are produced each nplots cuts
+}
+// check for input errors
+
+if (iLM != 1) // (caf 04/05/2018)
+{
+	cerr << "LMs other than Li (I_LM = 1) not yet implemented" << endl;
+	exit(1);
+} // if iLM
+
+if (iCPSs != 1) // (caf 15/05/2018)
+{
+	cerr << "CPS mesh materials other than W (I_CPS_SOL = 1) not yet implemented" << endl;
+	exit(1);
+} // if iCPSs
+
+if (abs(xLM-0.5) > 0.5) // (caf 15/05/2018)
+{
+	cerr << "X_REF must be between 0 and 1" << endl;
+	exit(1);
+} // if abs(xLM-0.5)
+
+if (itrans == 1) //Pseudotransient
+{	
+	cout << "Steady state calculation initialized by pseudotransient" << endl;
+} else if (itrans == 0) { //steady state
+	cout << "steady state calculation initialized by underrelaxed fixed-point iterations" << endl;
+	dt = 1; // dummy value for timestep in steady state calculation
+} else {
+	cerr << "I_SS must be 1 (steady-state with underrelaxed fixed-point iterations) or 0 (transient)" << endl;
+	exit(1);
+} // if itrans
+
+/* // cgfn verificare cosa non va con questa formulazione
+if (itrans == 1) //transient
+{
+	itrans = 0;
+	dt = 1; // dummy value
+} else if (itrans == 0) { //steady state
+	itrans = 1;
+} else {
+	cerr << "I_SS must be 1 (steady-state with underrelaxed fixed-point iterations) or 0 (transient)" << endl;
+	exit(1);
+} // if itrans
+*/
+
+if (inout==1) //inboard divertor
+{
+	sinout="l"; //cgfn "i" replaced by "l", consistently with SOLPS 2d_profiles nomenclature
+}
+else if (inout==0 || dbg) //outboard divertor //in debug considero outer perche' prende flussi positivi
+{
+	sinout="r"; //cgfn "o" replaced by "r", consistently with SOLPS 2d_profiles nomenclature
+}
+else
+{
+	sinout="unknown";
+	cerr << "Error in defining which target is being simulated" << endl; //cgfn
+	exit(1);							     //cgfn
+} // if inout
+
+real[int] Lout(npointout); //Acquisisco i punti toroidali cui valutare la temperatura per ogni tile
+//for (int kk=1; kk<=npointout; kk+=1)
+//{
+	//inputs >> Lout(kk-1);
+//}
+
+if (grid) // read grid independence parameter 
+{
+	//n = strtol(ARGV[2]);
+	//n = getARGV("-n",50);
+	cin >> n;
+}
+
+// (caf 15/05/2018)
+real fvlm = 1.0/(1.0+alphaCPS); //volume fraction of LM in CPS
+
+//Calcoli geometrici
+
+D2=D3+2.0*sss2;
+D1=D2+2.0*sss1;
+H=L1-D1/2.0-Hw;
+
+//Conversione in radianti
+alpha=aalpha*pi/180.0;
+beta=bbeta*pi/180.0;
+theta=ttheta*pi/180.0;
+
+Xshadow=(L*tan(beta)-Tgap*tan(theta))/(tan(beta)+tan(theta));
+
+if (dbg)
+{
+cout << "Xshadow= " << Xshadow << endl;
+}
+
+//////////////////////////
+//Part 2: materials data//
+//////////////////////////
+//FIXME potrei richiamare una libreria esterna di funzioni, o una funzione a fine script
+//AF ha ridefinito le proprieta' con delle macro, aggiungendo una f al nome per distinguere la funzione dai coefficienti in base ai quali viene calcolata.
+//FIXME dovrei fare verifica sulla validita' di queste formulazioni, confrontandole con dati sperimentali
+// Thermal conduct CuCrZr
+// caf require T in degC
+real[int] CCZ(4);
+CCZ(0)=5.257798071745529e-07;
+CCZ(1)=-6.451101399520426e-04;
+CCZ(2)=2.576784427085231e-01;
+CCZ(3)=3.129694443435334e+02;
+// caf 23/05/2015 redefine properties with macros
+macro kfCCZ(TT) CCZ(0)*TT^3.0+CCZ(1)*TT^2.0+CCZ(2)*TT+CCZ(3) // EOM
+
+// Density CuCrZr
+// data from http://www.mmluvata.com/Documents/Oxygen-free%20copper%20and%20special%20alloy%20data%20sheets/Chromium%20Zirconium%20Copper_ENG.pdf
+real rhocCCZ = 8900;
+// caf 23/05/2015 redefine properties with macros
+macro rhofCCZ(TT) rhocCCZ // EOM
+
+// Specific heat CuCrZr
+// data from http://www.mmluvata.com/Documents/Oxygen-free%20copper%20and%20special%20alloy%20data%20sheets/Chromium%20Zirconium%20Copper_ENG.pdf
+real cpcCCZ = 385;
+// caf 23/05/2015 redefine properties with macros
+macro cpfCCZ(TT) cpcCCZ // EOM
+
+// Thermal cond Cu
+// caf require T in degC
+real[int] CU(4);
+CU(0)=3.085132448660574e-08;
+CU(1)=-2.277103401239594e-05;
+CU(2)=-6.686469397617298e-02;
+CU(3)=4.021574134794590e+02;
+// caf 23/05/2015 redefine properties with macros
+macro kfCU(TT) CU(0)*TT^3.0+CU(1)*TT^2.0+CU(2)*TT+CU(3) // EOM
+
+// Density Cu
+// data from F. P. Incropera et al., Foundations of heat transfer, 6th edition
+real rhocCU = 8933;
+// caf 23/05/2015 redefine properties with macros
+macro rhofCU(TT) rhocCU // EOM
+
+// Specific heat Cu
+// data from J.W. Arblaster, Thermodynamic Properties of Copper, Journal of Phase Equilibria and Diffusion Vol. 36 No. 5 2015
+// caf require T in K
+real[int] cpcCU(5);
+real PMCU = 63.546e-3;
+cpcCU(4) = 23.55055/PMCU;
+cpcCU(3) = 6.89498e-3/PMCU;
+cpcCU(2) = -2.95229e-6/PMCU;
+cpcCU(1) = 1.78088e-9/PMCU;
+cpcCU(0) = -84616.4/PMCU;
+// caf 23/05/2015 redefine properties with macros
+macro cpfCU(TT) cpcCU(0)/((TT+273.15)^2.0)+cpcCU(1)*(TT+273.15)^3.0+cpcCU(2)*(TT+273.15)^2.0+cpcCU(3)*(TT+273.15)+cpcCU(4) // EOM
+
+// Thermal cond W
+// caf require T in degC
+real[int] WW(6);
+WW(0)=2.763634292770776e-16;
+WW(1)=-2.020389882180738e-12;
+WW(2)=-2.780235961230648e-09;
+WW(3)=4.516924060319057e-05;
+WW(4)=-1.054501953718856e-01;
+WW(5)=1.750724560926432e+02;
+// caf 23/05/2015 redefine properties with macros
+macro kfW(TT) WW(0)*TT^5.0+WW(1)*TT^4.0+WW(2)*TT^3.0+WW(3)*TT^2.0+WW(4)*TT+WW(5) // EOM
+
+// Density W
+// data from P. Tolias et al., Analytical expressions for thermophysical properties of solid and liquid tungsten relevant for fusion applications, Nuclear Materials and Energy 13 (2017) 42–57
+// caf require T as relative to 293.15 K (20 degC)
+real[int] rhocW(4);
+rhocW(0) = -9.5185e-9;
+rhocW(1) = -3.0595e-6;
+rhocW(2) = -2.66207e-1;
+rhocW(3) = 19250;
+// caf 23/05/2015 redefine properties with macros
+macro rhofW(TT) rhocW(0)*(TT-20)^3.0+rhocW(1)*(TT-20)^2.0+rhocW(2)*(TT-20)+rhocW(3) // EOM
+
+// Specific heat W
+// data from P. Tolias et al., Analytical expressions for thermophysical properties of solid and liquid tungsten relevant for fusion applications, Nuclear Materials and Energy 13 (2017) 42–57
+// caf require T in K
+real[int] cpcW(5);
+real PMW = 183.34e-3;
+cpcW(0) = 1.406637e4/PMW;
+cpcW(1) = 1.075862e-9/PMW;
+cpcW(2) = -3.756196e-6/PMW;
+cpcW(3) = 8.068661e-3/PMW;
+cpcW(4) = 21.868372/PMW;
+// caf 23/05/2015 redefine properties with macros
+macro cpfW(TT) cpcW(0)/((TT+273.15)^2.0)+cpcW(1)*(TT+273.15)^3.0+cpcW(2)*(TT+273.15)^2.0+cpcW(3)*(TT+273.15)+cpcW(4) // EOM
+
+//Proprieta' del LM 
+
+real[int] LMk(3), hLM(2), rhocLM(2);
+real hfgLM, PMLM, cpcLM;
+if (iLM == 1) // (caf 15/05/2018)
+{
+	// Thermal cond Li (caf 15/05/2018) from H. W. Davison, COMPILATION OF THERMOPHYSICAL PROPERTIES OF LIQUID LITHIUM, NASA, WASHINGTON, D. C., 1968
+	// caf require T in K
+	LMk(2) = 21.874;
+	LMk(1) = 0.056255;
+	LMk(0) = -1.8325e-5;
+	
+	// Density Li
+	// data from H. W. Davison, COMPILATION OF THERMOPHYSICAL PROPERTIES OF LIQUID LITHIUM, NASA, WASHINGTON, D. C., 1968
+	// caf require T in K
+	rhocLM(0) = -0.100;
+	rhocLM(1) = 562;
+
+	// Specific heat Li
+	// data from H. W. Davison, COMPILATION OF THERMOPHYSICAL PROPERTIES OF LIQUID LITHIUM, NASA, WASHINGTON, D. C., 1968
+	cpcLM = 4169;
+	
+	// Latent heat Li (caf 04/05/2018)
+	hfgLM = 20.93e6;
+
+	// Molecular weight Li (caf 15/05/2018) [kg/mol]
+	PMLM = 6.941e-3;
+
+	// Enthalpy LM (caf 04/05/2018)
+	// caf require T in K
+	hLM(0) = -7.519e5; // h0
+	hLM(1) = 4169; // cp
+} else {
+	cerr << "LMs other than Li (I_LM = 1) not yet implemented" << endl;
+	exit(1);
+} // if iLM
+// cgfn FIXME quando aggiungo proprieta' dello stagno devo fare attenzione a sfruttare formulazioni analoghe (idealmente a variare sarebbero solo i coefficienti).
+// caf 23/05/2015 redefine properties with macros
+macro kfLM(TT) LMk(0)*(TT+273.15)^2.0+LMk(1)*(TT+273.15)+LMk(2) // EOM
+macro rhofLM(TT) rhocLM(0)*(TT+273.15)+rhocLM(1) // EOM
+macro cpfLM(TT) cpcLM // EOM
+macro hfLM(TT) hLM(0)+hLM(1)*(TT+273.15) // EOM
+
+// Sat pressure LM (caf 04/05/2018)
+// caf require T in degC
+macro psatLM(TLM) 10^(10.015-(8064.5/(TLM+273.15))) // EOM
+
+////////////////////////////////////
+// Part 3: Load heat flux profile //
+////////////////////////////////////
+
+//Leggo il numero di tiles da un apposito file denominato dimensions.dat. FIXME come idea, il numero di tiles puo' essere uguale al numero di celle di SOLPS sul target. In caso se ne usino di piu', devo prevedere interpolazioni.
+
+int Ntile; 
+if (!dbg) // (caf 04/05/2018)
+{
+	//ifstream size1("tg"+sinout+"_size.dat"); //cgfn modifico il file da cui leggo
+        ifstream size1("./exchange/dimensions.dat");
+	size1 >> Ntile;
+} else {
+	if (!timedbg)
+	{
+		Ntile = 10; // (caf 04/05/2018)
+        	ifstream size1("./exchange/dimensions.dat"); //cgfn also for debug purposes
+		size1 >> Ntile;
+	} else {
+		Ntile = 5; // (caf 24/05/2018)
+        	ifstream size1("./exchange/dimensions.dat"); //cgfn also for debug purposes
+		size1 >> Ntile;
+	}
+}
+
+//Leggo carico termico
+
+real[int] qtot(Ntile);
+real[int] qpls(Ntile);
+real[int] X(Ntile); //cgfn le coordinate vengono lette dal medesimo file da cui leggo il carico
+
+//cgfn qui inserisco il ciclo while che risolve il problema stazionario. Questo viene usato per inizializzare il calcolo, dal momento che SOLPS parte da uno stato stazionario. Una volta trovato l'equilibrio con il carico termico dichiarato in SOLPS, parte un analogo calcolo transitorio.
+//CGFN FIXME NON SONO CONVINTO DELLA POSIZIONE IN CUI SI TROVA LA LETTURA DEL FILE associata alla risoluzione del calcolo stazionario
+//cgfn FIXME se modifico questa lettura sotto, devo essere coerente anche qui sopra
+//cgfn attendo fino a che il file non e' prodotto 
+
+cout << "**********************************************************" << endl; 
+cout << "Attendo file ft3dr.last10.rt per iniziare calcolo stazionario" << endl; 
+cout << "**********************************************************" << endl; 
+bool exists=false;
+
+while (exists==false)
+{
+	try {
+		ifstream ffem("./exchange/ft3dr.last10.rt");
+		if (ffem.good())
+			exists=true;
+	} 
+	catch(...) {exec("sleep 0.01");} //per ora non uso il valore di waittime, dovrei concatenare stringa
+//cgfn si ricordi che il waittime serve a dare tempo a fortran di aprire run_freefem.dat, di scrivere il valore di dt e di chiudere il file.
+}//while (exists==false) 
+cout << "**********************************************************" << endl; 
+cout << "Trovato file ft3dr.last10.rt per iniziare calcolo stazionario" << endl; 
+cout << "**********************************************************" << endl; 
+
+//////////////////////////////////////
+//Steady state calculation////////////
+//////////////////////////////////////
+
+cout << "Inizio conto stazionario..." << endl; 
+
+ifstream www1("./exchange/ft3dr.last10.rt"); //cgfn sto leggendo file con carico termico totale
+{
+// FIXME separare inner ed outer divertor, che leggeranno da file differenti
+	ofstream ffsteady("./outputs/steady_out.dat");  //cgfn FIXME forse inutile
+	
+for(int nn=0; nn<Ntile; nn+=1)
+{
+	if (!dbg) // (caf 04/05/2018)
+	{
+		//ifstream www1("Wtot_tg"+sinout+".dat"); cgfn leggo da un unico file
+		//ifstream www2("Wpls_tg"+sinout+".dat");
+
+		//www1 >> qtot(nn);
+		//www2 >> qpls(nn);
+
+		www1 >> X(nn) >> qpls(nn);
+		//cgfn taglio a zero il carico termico sui tiles piu' lontani. Per inboard divertor i carichi validi sono <0, gli altri vanno tagliati a zero. Al contrario, per outboard divertor i carichi validi sono >0, gli altri vanno tagliati a zero.
+		if (inout==1 && qpls(nn)>0.)
+			qpls(nn)=0.;
+		else if (inout==0 && qpls(nn)<0.)
+			qpls(nn)=0.;
+		cout << "Tile number " << nn << ": " << "X=" << X(nn) << " (m); qtot=" << qpls(nn) << " (W/m^2)" <<endl;
+		qtot(nn)=qpls(nn); //cgfn per ora non distinguo fra carico di plasma e carico totale
+
+	} else { // (caf 04/05/2018)
+		//qtot(nn) = 1e6;
+		//qpls(nn) = 1e6;
+		www1 >> X(nn) >> qpls(nn);
+		//cgfn taglio a zero il carico termico sui tiles piu' lontani. Per inboard divertor i carichi validi sono <0, gli altri vanno tagliati a zero. Al contrario, per outboard divertor i carichi validi sono >0, gli altri vanno tagliati a zero.
+		if (inout==1 && qpls(nn)>0.)
+			qpls(nn)=0.;
+		else if (inout==0 && qpls(nn)<0.)
+			qpls(nn)=0.;
+		cout << "Tile number " << nn << ": " << "X=" << X(nn) << " (m); qtot=" << qpls(nn) << " (W/m^2)" <<endl;
+		qtot(nn)=qpls(nn); //cgfn per ora non distinguo fra carico di plasma e carico totale
+		ofstream fftrans ("./outputs/transient_out_tile"+nn+".dat");	
+	}
+	if (itrans == 1)
+	{
+		ofstream fftrans ("./outputs/transient_out_tile"+nn+".dat");
+		ofstream ffsteady("./outputs/steady_out_tile"+nn+".dat");  //cgfn FIXME forse inutile
+	}
+	
+} // for(int nn=0; nn<Ntile; nn+=1)
+} //ifstream
+
+//cgfn questa parte risulta ora obsoleta
+/*
+if (dbg)
+{
+	if (Ntile==10)
+	{
+		qtot = 2e6:2e6:20e6;
+	} else if (Ntile == 5)
+	{
+		qtot = 4e6:4e6:20e6;
+	}
+}
+*/
+
+/////////////////////////////////////////////////////
+// Part 4: Declare output vectors and generate mesh//
+/////////////////////////////////////////////////////
+
+// output vectors
+real[int] Tmax(Ntile); //maximum temperature for each tile
+real[int] TmaxCU(Ntile);
+real[int] TmaxCCZ(Ntile);
+real[int] TmaxCPS(Ntile);
+real[int] TmaxW(Ntile);
+real[int] Twater(Ntile); //water temperature for each tile
+real[int] Qreal(Ntile);
+real[int] HTC(Ntile);
+real[int] Qin(Ntile); // total (linear) power input (caf 17/05/2018)
+real[int] Qcool(Ntile); // total (linear) power to coolant (caf 17/05/2018)
+real[int] Qlm(Ntile); // total (linear) power removed by LM (defined as mev*(h_l(T_ev)+hfg-h_l(TrefLM))) (caf 17/05/2018)
+real[int] Qfcool(Ntile); // fraction of power to coolant (caf 17/05/2018)
+real[int] Qflm(Ntile); // fraction of power removed by LM (caf 17/05/2018)
+real[int] Mev(Ntile); // Evaporative mass flux (caf 17/05/2018)
+real[int, int] Tout(Ntile, npointout); //salvo tre valori di temperatura per ogni tile (su tre punti toroidali per ogni punto -tile- poloidale)
+real[int] Tave(Ntile); //Temperatura equivalente calcolata da freefem tale da fornire la stessa portata evaporativa rispetto al profilo calcolato
+real[int] Taveave(Ntile);
+real[int] TaveOld(Ntile);
+real TTMAX=0.0, TCMAX=0.0;
+int IMAX=0, ICMAX=0;
+
+// Domain generation
+border A(t=0.,L){x=t;y=0.;};
+border B(t=0.,L1-LMth){x=L;y=t;}; // (caf 04/05/2018)
+border BLM(t=0.,LMth){x=L;y=L1-LMth+t;}; // (caf 04/05/2018)
+border C(t=L,0.){x=t;y=L1-LMth+(t-L)*tan(beta);}; // (caf 04/05/2018)
+border CLM(t=L,0.){x=t;y=L1+(t-L)*tan(beta);}; // (caf 04/05/2018)
+border D(t=L1-LMth-L*tan(beta),0.){x=0.0;y=t;}; // (caf 04/05/2018)
+border DLM(t=L1-L*tan(beta),L1-LMth-L*tan(beta)){x=0.0;y=t;}; // (caf 04/05/2018)
+border EE(t=0.,2.*pi){x=L/2.+D1/2.*cos(t);y=H+D1/2.*sin(t);};
+border FF(t=0.,2.*pi){x=L/2.+D2/2.*cos(t);y=H+D2/2.*sin(t);};
+border GG(t=0.,2.*pi){x=L/2.+D3/2.*cos(t);y=H+D3/2.*sin(t);};
+
+//plot(A(n)+B(n)+BLM(n/2)+C(n)+CLM(n)+D(n)+DLM(n/2)+EE(3*n)+FF(2*n)+GG(-2*n));
+mesh block=buildmesh(A(n)+B(n)+BLM(n/6)+C(2*n)+CLM(2*n)+D(n)+DLM(n/6)+EE(3*n)+FF(2*n)+GG(-2*n)); // (caf 04/05/2018)
+string meshname;
+if (!grid)
+{
+	meshname = "Domain_V.eps";
+} else {
+	meshname = "Domain_V_n"+n+".eps";
+}
+//if (!autogrid)
+//{
+//	plot(block,fill=1,ps=meshname);
+//}
+
+///////////////////////////////
+// Part 5: PROBLEM DEFINITION//
+///////////////////////////////
+
+//Define regions
+int ww=block((L-D1)/2.-1e-4,H).region, cu=block((L-D2)/2.-(D1-D2)/4.,H).region;
+int ccz=block((L-D3)/2.-(D2-D3)/4.,H).region, cps=block(L/2.,L1-LMth/2.).region; // (caf 04/05/2018)
+
+fespace Vh(block,P1);
+fespace Vh0(block,P0);
+Vh T=Tf,v,Told=Tf,TTT,TMAX,kCCZ,kCu,kW,kCPS,klm,rhoCCZ,rhoCu,rhoW,rhoCPS,rholm,cpCCZ,cpCu,cpW,cpCPS,cplm,htc,mev=0,dmev,hL,fmlm;
+Vh0 K,rho,cp,HF,qq; // (caf 04/05/2018) cgfn ho aggiunto fmlm qui
+Vh[int] Toldtile(Ntile); //cgfnmod
+real h0LM = hfLM(TrefLM), mav, errmev, errmevnew; // (caf 04/05/2018, 15/05/2018) 
+//real h0LM = hLM(0)+hLM(1)*(TrefLM+273.15), mav, errmev, errmevnew; // caf 23/05/2018 redefine properties with macros
+// caf 23/05/2018 redefine properties with macros
+macro fhtc(TT) (2.1415e-3*(TT^3.0)-1.2231*(TT^2.0)+2.6941e2*TT+5.6162e+04)*(TT<270.0)+(-2.6549e-07*(TT^5.0)+4.6179e-04*(TT^4.0)-0.32055*(TT^3.0)+2.4134e2*(TT^2.0)-8.9665e+04*TT+1.0945e+07)*(TT>=270.0) // EOM
+
+//define problem
+
+problem divert(T,v)=int2d(block,optimize=0)(K*(dx(T)*dx(v)+dy(T)*dy(v)))-int1d(block,CLM)(qq*v) // CLM (caf 04/05/2018)
+				   -int1d(block,GG)(htc*Tf*v)+int1d(block,GG)(htc*T*v)//; (caf 04/05/2018)
+				   +int1d(block,CLM)(mev*hfgLM*v)+int1d(block,CLM)(mev*hL*v) // (caf 04/05/2018) add evaporation term
+				   -int1d(block,DLM)(mav*h0LM*(1-xLM)*v)-int1d(block,BLM)(mav*h0LM*xLM*v)// ; (caf 15/05/2018) add refill
+				   +int2d(block,optimize=0)(itrans*rho*cp*T/dt*v)-int2d(block,optimize=0)(itrans*rho*cp*Told/dt*v); // caf 23/05/2018 add transient term
+
+real gamma,npoints=300.0,hfmax,hflux,CHF=40.0e6;
+
+// Energy conservation check
+real ensource,eninLM,enoutLM,enoutcool;
+real enerrA = qq, enerrR = 1.0;
+
+// Loop on the monoblock length
+//ofstream ff00("Qwater.dat");
+//ofstream ff01("Qplasma.dat");
+//open warning log file
+string ff02name;
+if (!grid)
+{
+	ff02name = "warning_VT_"+sinout+".log";
+} else {
+	ff02name = "warning_VT_"+sinout+"_n"+n+".log";
+}
+ofstream ff02(ff02name);
+
+real flag=0.0;
+TTMAX=0.0;
+mev = PMLM*eta*(psatLM(TrefLM)/sqrt(2.0*pi*PMLM*R0*(TrefLM+273.15)));
+if (verb > 0)
+{
+	cout << "h0LM = " << h0LM << " J/kg" << endl;
+	cout << "xLM = " << xLM << endl;
+}
+
+/////////////////////////////////////////////
+// Part 6: RISOLUZIONE PROBLEMA STAZIONARIO//
+/////////////////////////////////////////////
+
+//6.1 Risoluzione del problema stazionario (inizializzazione delle temperature)
+
+//ciclo principale (sui tiles)
+for(int itile=0;itile<Ntile;itile++)
+{
+	if (dbg && !grid)
+	{
+		ofstream ffdbg("./debug/tmaxdbg"+(itile+1)+".log");
+		ffdbg << "% iter\tunderrel\tTmax\terrmev_old\terrmev_new\terr" << endl;
+	}
+	qq=(qpls(itile)/cos(beta+alpha))*(x>=Xshadow)+(qtot(itile)-qpls(itile));
+	Qreal(itile)=qpls(itile)/cos(beta+alpha)+qtot(itile)-qpls(itile);
+	real err,tol=1.0e-6, tolmev=1.0e-4, tolTave=1.0e-3;
+	if (itrans==1)
+	{
+		Told=Tf; //cgfn FIXME potrebbe non essere richiesto
+	}
+	if (verb > 0)
+	{
+		cout << endl;
+		cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+		cout << "tile number " << itile << endl;
+		cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+		cout << "psat = " << int1d(block,CLM)(psatLM(TrefLM))/int1d(block,CLM)(1.0) << " Pa" << endl;
+		cout << "qq= " << qq[] << endl;
+		cout << "Qreal(itile)= " << Qreal(itile) << endl;
+		cout << "qpls(itile)= " << qpls(itile) << endl;
+	}
+	real qwater=0.0,qplasma=0.0;
+	// Solve pseudo transient on the single tile
+	int ii=0;
+	real tttt = 1.0;
+	if (itrans == 0)
+	{
+		tttt = min(2e17/(qtot(itile)^3+epsilon),0.04); // relaxation parameter on mev
+	}
+	bool conv = false; // convergence flag (caf 16/05/2018)
+	time = 0;
+	while (!conv && ii<ITERMAX)
+	{
+		if (itrans == 1)
+		{
+			time += dt;
+		}
+		// caf 23/05/2015 redefine properties with macros
+		/*kCCZ=CCZ(0)*T^3.0+CCZ(1)*T^2.0+CCZ(2)*T+CCZ(3);
+		kCu=CU(0)*T^3.0+CU(1)*T^2.0+CU(2)*T+CU(3);
+		kW=WW(0)*T^5.0+WW(1)*T^4.0+WW(2)*T^3.0+WW(3)*T^2.0+WW(4)*T+WW(5);
+		klm=LMk(0)*(T+273.15)^2.0+LMk(1)*(T+273.15)+LMk(2); // caf add 15/05/2018*/
+		kCCZ = kfCCZ(T);
+		kCu = kfCU(T);
+		kW = kfW(T);
+		klm = kfLM(T);
+		rhoCCZ = rhofCCZ(T);
+		rhoCu = rhofCU(T);
+		rhoW = rhofW(T);
+		rholm = rhofLM(T);
+		cpCCZ = cpfCCZ(T);
+		cpCu = cpfCU(T);
+		cpW = cpfW(T);
+		cplm = cpfLM(T);
+		fmlm = rholm/(rholm+rhoW*alphaCPS);
+		if (iCPSs == 1) // caf add 15/05/2018
+		{
+//cgfn FIXME verificare che i pesi scelti (frazione volumica e massica, rispettivamente) siano adeguati.
+			kCPS = fvlm*klm + (1-fvlm)*kW; // from T. W. Morgan et al., Power handling of a liquid-metal based CPS structure under high steady-state heat and particle fluxes, Nucl. Mat. En. 12, pp. 210-215 (2017)
+			rhoCPS = fvlm*rholm + (1-fvlm)*rhoW; // from T. W. Morgan et al., Power handling of a liquid-metal based CPS structure under high steady-state heat and particle fluxes, Nucl. Mat. En. 12, pp. 210-215 (2017)
+			cpCPS = fmlm*cplm + (1-fmlm)*cpW; // from T. W. Morgan et al., Power handling of a liquid-metal based CPS structure under high steady-state heat and particle fluxes, Nucl. Mat. En. 12, pp. 210-215 (2017)
+		} else { // add additional CPS conductivity definitions in elseif branches here
+			cerr << "CPS mesh materials other than W (I_CPS_SOL = 1) not yet implemented" << endl;
+			exit(1); // should never get here, as this check was performed when reading input
+		}
+		K=kW*(region==ww)+kCu*(region==cu)+kCCZ*(region==ccz)+kCPS*(region==cps);
+		rho=rhoW*(region==ww)+rhoCu*(region==cu)+rhoCCZ*(region==ccz)+rhoCPS*(region==cps);
+		cp=cpW*(region==ww)+cpCu*(region==cu)+cpCCZ*(region==ccz)+cpCPS*(region==cps);
+		//htc=(2.1415e-3*(T^3.0)-1.2231*(T^2.0)+2.6941e2*T+5.6162e+04)*(T<270.0)+(-2.6549e-07*(T^5.0)+4.6179e-04*(T^4.0)-0.32055*(T^3.0)+2.4134e2*(T^2.0)-8.9665e+04*T+1.0945e+07)*(T>=270.0); // caf 23/05/2018 redefine properties with macros
+		htc = fhtc(T);
+		mav = int1d(block,CLM)(mev)/LMth;
+		//hL = hLM(0) + hLM(1)*(T+273.15); // caf 23/05/2018 redefine properties with macros
+		hL = hfLM(T);
+		if (dbg && !grid)
+		{
+			if (verb > 0){
+				if (ii>0)
+				{
+					cout << "average psat = " << int1d(block,CLM)(psatLM(Told))/int1d(block,CLM)(1.0) << " Pa" << endl;
+				}
+				cout << "average mev = " << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << " kg/(m2 s)" << endl;
+				cout << "mav = " << mav << " kg/(m2 s)" << endl;
+				if (verb > 1)
+				{
+					plot(K,fill=1,value=1,wait=1,cmm="K");
+					plot(rho,fill=1,value=1,wait=1,cmm="rho");
+					plot(cp,fill=1,value=1,wait=1,cmm="cp");
+					plot(htc,fill=1,value=1,wait=1,cmm="h");
+					plot(mev,fill=1,value=1,wait=1,cmm="mev");
+					plot(hL,fill=1,value=1,wait=1,cmm="hL");
+					/*int asp;
+					cin >> asp;*/
+				}
+			}
+			cout << "Solve iteration " << ii+1 << endl << endl;
+		}
+
+		divert; //problem solution
+
+		T=T*(T<3000 & T>=Tf)+3000*(T>=3000)+Tf*(T<Tf);
+		if (verb > 1)
+		{
+			plot(T,fill=1,value=1,wait=1,cmm="T");
+			/*int asp;
+			cin >> asp;*/
+		}
+		err=sqrt(int2d(block)((T-Told)^2.0))/sqrt(int2d(block)(T^2.0));
+		ensource = int1d(block,CLM)(qq);
+		eninLM = int1d(block,DLM)(mav*h0LM*(1-xLM))+int1d(block,BLM)(mav*h0LM*xLM);
+		enoutLM = int1d(block,CLM)(mev*hfgLM)+int1d(block,CLM)(mev*hL);
+		enoutcool = -int1d(block,GG)(htc*Tf)+int1d(block,GG)(htc*T);
+
+		dmev = (PMLM*eta*(psatLM(T)/sqrt(2.0*pi*PMLM*R0*(T+273.15)))) - mev;
+		mev = tttt*dmev + mev;
+
+		errmevnew = sqrt(int1d(block,CLM)((dmev*(tttt-1))^2.0))/sqrt(int1d(block,CLM)(mev^2.0));
+		
+		//cgfn Inserisco calcolo della temperatura media
+		real errNewt=1;
+		real tolNewt=1E-3;
+		int maxItNewt=100;
+		real TempOld=T[].max; //cgfn inizializzo con un buon guess
+		real Temp=0.0;
+		int nItNewt=0;
+		real mevIntegrata;
+		real mevATMedia;
+		int maxItNewton;
+		real errTave=1.0;
+		while (errNewt>tolNewt && nItNewt<100)
+		{
+			//cgfn FIXME per ora la faccio sporca e hardcodo la formula
+			real INTEGR=int1d(block,CLM)(PMLM*eta*(psatLM(T)/sqrt(2.0*pi*PMLM*R0*(T+273.15))));
+	        	real ffnewt=10^(-8064.5/(TempOld+273.15))/sqrt(TempOld+273.15)-INTEGR/L/PMLM/eta*sqrt(2.0*pi*PMLM*R0)/10^10.015;
+			real ffder=10^(-8064.5/(TempOld+273.15))/(TempOld+273.15)*(8064.5/((TempOld+273.15)^(3/2))-1/sqrt(TempOld+273.15));
+		    	Temp=TempOld-ffnewt/ffder;
+		    	nItNewt=nItNewt+1;
+			mevIntegrata = int1d(block,CLM)(PMLM*eta*(psatLM(T)/sqrt(2.0*pi*PMLM*R0*(T+273.15))));
+			mevATMedia =   L*PMLM*eta*(psatLM(Temp)/sqrt(2.0*pi*PMLM*R0*(Temp+273.15)));
+		    	//errNewt=abs((TempOld-Temp)/TempOld);
+			errNewt=abs(mevIntegrata-mevATMedia)/mevIntegrata; //calcolo errore sulla quantita che sono interessato a conservare
+		    	TempOld=Temp;
+			//cout << "iteration " << nItNewt << "TempOld " << TempOld << endl;
+		}
+		if (nItNewt==100)
+		{
+			cout << "max number of iteration in Newton method exceeded" << endl;
+		}
+
+		Tave(itile)=Temp;
+
+		if (ii>0)
+			errTave = abs(Tave(itile)-TaveOld(itile))/TaveOld(itile);
+		
+		// cgfn fine calcolo temperatura media
+
+		cout << "Tile # " << itile << ", qtot=" << qpls(itile) << "(W/m^2), #it=" << ii+1 << " Tmax="<< T[].max << " Tave=" << Temp << " errTave=" << errTave << "errmev=" << errmevnew << endl;
+		
+		TaveOld(itile)=Temp;
+
+		//cout << "err=   " << err << endl;
+		//cout << "errmev=" << errmevnew << endl;
+        //cout << "Tile #" << nn << ": " << "X=" << X(nn) << " (m); qtot=" << qpls(nn) << " (W/m^2)" <<endl;
+		
+		if (dbg && !grid)
+		{
+			if (verb > 0)
+			{
+				errmev = sqrt(int1d(block,CLM)((dmev)^2.0))/sqrt(int1d(block,CLM)(mev^2.0));
+				enerrA = abs(ensource+eninLM-enoutLM-enoutcool);
+				enerrR = enerrA/(ensource+epsilon);
+				cout << "Energy source = " << ensource << " W/m" << endl;
+				cout << "Energy flux in via LM = " << eninLM << " W/m" << endl;
+				cout << "Energy flux out via LM = " << enoutLM << " W/m" << endl;
+				cout << "Energy flux out via coolant = " << enoutcool << " W/m" << endl;
+				//cout << "Abs error on energy conservation = " << enerrA << " W/m" << endl;
+				//cout << "Rel error on energy conservation = " << enerrR*100 << " %" << endl;
+				cout << "Rel diff on mev (old) = " << errmev << endl;
+				cout << "Rel diff on mev (new) = " << errmevnew << endl;
+				cout << "Rel error on fixed-point = " << err << endl;
+			}
+			ofstream ffdbg("./debug/tmaxdbg"+(itile+1)+".log",append);
+			ffdbg << ii << "\t" << tttt << "\t" << T[].max << "\t" << errmev << "\t" << errmevnew << "\t" << err << endl;
+		}
+		if (itrans == 0)
+		{
+			if (err<5e-5)
+			{
+				tttt=min(10e20/(qtot(itile)^3+epsilon),0.8);
+			}
+			if (err<1e-4)
+			{
+				tttt=min(5e20/(qtot(itile)^3+epsilon),0.8);
+			}
+			if (err<1e-3)
+			{
+				tttt=min(1e20/(qtot(itile)^3+epsilon),0.2);
+			}
+			if (err<1e-2)
+			{
+				tttt=min(5e19/(qtot(itile)^3+epsilon),0.1);
+			}
+			if (err<1e-1)
+			{
+				tttt=min(1e19/(qtot(itile)^3+epsilon),0.05);
+			}						
+			else
+			{
+				tttt=min(1e19/(qtot(itile)^3+epsilon),0.05);
+			}		
+			if (ii<10)
+				tttt=tttt/10;	
+			//cgfn vecchia formulazione
+			/*if (err<1e-1)
+			{
+				tttt=min(1e19/(qtot(itile)^3+epsilon),0.05);
+			}
+			if (err<1e-2)
+			{
+				tttt=min(5e19/(qtot(itile)^3+epsilon),0.1);
+			}
+			if (err<1e-3)
+			{
+				tttt=min(1e20/(qtot(itile)^3+epsilon),0.2);
+			}
+			if (err<1e-5)
+			{
+				tttt=min(4e20/(qtot(itile)^3+epsilon),0.4);
+			}
+            */
+			if(verb>0)
+            {
+			ofstream ffsteady("./outputs/steady_out_tile"+itile+".dat",append);
+			ffsteady << ii << "\t" << T[].max << "\t" << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << "\t" << endl;        
+			}
+
+		} else if (itrans == 1)
+		{
+			ofstream fftrans("./outputs/transient_out_tile"+itile+".dat",append);
+			fftrans << time << "\t" << T[].max << "\t" << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << "\t" << endl;
+		}
+		Told=T; //cgfnmod FIXME non sono sicuro della correttezza, verificare funzionamento della modalita semplice pseudotransient
+		ii++;
+		//conv = (err<=tol && errmevnew <= tolmev && ii>10); cgfn velocizzo inizializzazione
+		conv= (errTave<=tolTave);
+	} // end pseudo transient
+	
+	ofstream ffsteady("./outputs/steady_out.dat",append);
+	ffsteady << itile << "\t" << Tave(itile) << "\t" << endl;   		
+				
+	if (ii==ITERMAX)
+	{
+		ff02 << "Warning! Maximum number of iterations (" << ITERMAX << ") reached. Error on fixed-point iterations: " << err << ". Error on evap. mass flow: " << errmevnew << ". Tile number " << itile <<endl;
+		flag=-2.0;
+	}
+	if (timedbg && itrans == 1)
+	{
+		ofstream ffdbg("./debug/tmaxdbg"+(itile+1)+".log",append);
+		ffdbg << "% Transient end time: " << time << " s" << endl;
+	}
+	
+	Qin(itile) = ensource;
+	Qcool(itile) = enoutcool;
+	Qlm(itile) = enoutLM-eninLM;
+	Qfcool(itile) = enoutcool*100/(ensource+epsilon);
+	Qflm(itile) = Qlm(itile)*100/(ensource+epsilon);
+	Mev(itile) = int1d(block,CLM)(mev)/int1d(block,CLM)(1.0); // uses relaxed value
+	
+	Twater(itile)=Tf;
+	HTC(itile)=int1d(block,GG)(htc)/int1d(block,GG)(1.0);
+	
+	// Evaluate next T bulk
+	qwater=(-int1d(block,GG)(htc*Tf)+int1d(block,GG)(htc*T))*2.0*Ltile;
+	//Tf=Tf+qwater/mflow/cpw; cgfn non aggiorno la temperatura ddell'acqua per questa valutazione preliminare. Poi potro' fare valutazione in funzione della temperatura dell'acqua, in modo da consentire a SOLPS interpolazione bivariata. In quel caso la variabile in input sarebbe la temperatura dell'acqua in ingresso.
+	
+	// Check for CHF (40 MW/m^2)
+	HF=htc*(T-Tf);
+	hfmax=0.0;
+	for (int ii=0;ii<=npoints;ii+=1.0)
+	{
+		gamma=ii/npoints*pi/2.0;
+		hflux=HF(L/2.+D3/2.*cos(pi/2.-gamma),H+D3/2.*sin(pi/2.-gamma));
+		if(hflux>=hfmax){
+			hfmax=hflux;
+		}
+	}
+	
+	if(hfmax>=CHF)
+	{
+		ff02 << "Warning! Reached critical heat flux of "<< CHF <<" W/m^2. Tile number " << itile <<endl;
+		flag=-9.0;
+	}
+	
+	for (int ii=1;ii<=npointout;ii+=1)
+	{
+		Tout(itile,ii-1)=T(Lout(ii-1),L1+(Lout(ii-1)-L)*tan(beta));
+	}
+	
+	Tmax(itile)=T[].max;
+	if (Tmax(itile)>=TTMAX)
+	{
+		TTMAX=Tmax(itile);
+		TMAX=T;
+	}
+	
+	TTT=0.0*(region==ww)+0.0*(region==ccz)+T*(region==cu)+0.0*(region==cps);
+	TmaxCU(itile)=TTT[].max;
+	if(TmaxCU(itile)>700.0)
+	{
+		ff02 << "Warning! Cu temperature exceeds properties range of 700 C. Tile number " << itile << " T_Cu= " << TmaxCU(itile) << " C" <<endl;
+		flag=-9.0;
+	}
+	TTT=T*(region==ww)+0.0*(region==ccz)+0.0*(region==cu)+0.0*(region==cps);
+	TmaxW(itile)=TTT[].max;
+	if(TmaxW(itile)>3200.0)
+	{
+		ff02 << "Warning! W temperature exceeds properties range of 3200 C. Tile number " << itile << " T_W= " << TmaxW(itile) << " C" <<endl;
+		flag=-9.0;
+	}
+	TTT=0.0*(region==ww)+T*(region==ccz)+0.0*(region==cu)+0.0*(region==cps);
+	TmaxCCZ(itile)=TTT[].max;
+	if(TmaxCCZ(itile)>433.0){
+		ff02 << "Warning! CuCrZr temperature exceeds properties range of 433 C. Tile number " <<itile<<" T_CCZ= "<< TmaxCCZ(itile)<<" C" <<endl;
+		flag=-9.0;
+	}
+	TTT=0.0*(region==ww)+0.0*(region==ccz)+0.0*(region==cu)+T*(region==cps);
+	TmaxCPS(itile)=TTT[].max;
+	if(TmaxCPS(itile)>3200.0){
+		ff02 << "Warning! CPS temperature exceeds properties range of 3200 C. Tile number " <<itile<<" T_CPS= "<< TmaxCPS(itile)<<" C" <<endl;
+		flag=-9.0;
+	}
+	if (!autogrid)
+	{
+		plot(T,fill=1,value=1);
+		if (itile==iplot)
+		{
+			string name = "./plots/Temp2D_VT_"+sinout+"_" + (itile+1) + ".eps";
+			plot(T,fill=1,value=1,ps=name);
+			iplot=iplot+nplots;
+		}
+	}
+
+	// cgfn salvo ultimo profilo disponibile di temperatura
+	Toldtile[itile]=T;
+	
+}// for(int itile=0;itile<Ntile;itile++)
+
+//6.2 Scrivo output in modo che octave o SOLPS-ITER inizino il loro calcolo
+
+{
+ofstream res("./exchange/fromfreef.dat"); //write variables to be read by FORTRAN
+for (int itile=1;itile<Ntile;itile+=1)
+	res << Tmax(itile);
+} // close fromfreef.dat
+
+string name;
+if (!grid)
+{
+	name = "./plots/Temp2D_VT_"+sinout+"_" + Ntile + ".eps";
+} else {
+	name = "./plots/Temp2D_VT_"+sinout+"_" + Ntile + "_n" + n + ".eps";
+}
+
+if (!autogrid)
+{
+	plot(T,fill=1,value=1,ps=name);
+}
+if (!grid)
+{
+	name = "./plots/Temp2D_VT_"+sinout+"_MAX.eps";
+} else {
+	name = "./plots/Temp2D_VT_"+sinout+"_n"+n+"_MAX.eps";
+}
+//if (!autogrid)
+//{
+	//plot(TMAX,fill=1,value=1,ps=name);
+//}
+/*
+if (!grid) // caf 17/05/2018 reduce output footprint for grid independence
+{
+	ofstream ff1("./outputs/T_CCZ_VT_"+sinout+".dat");
+	ofstream ff10("./outputs/T_CPS_VT_"+sinout+".dat");
+	ofstream ff2("./outputs/T_Cu_VT_"+sinout+".dat");
+	ofstream ff3("./outputs/T_W_VT_"+sinout+".dat");
+	ofstream ff4("./outputs/T_water_VT_"+sinout+".dat");
+	ofstream ff6("./outputs/Tout_VT_"+sinout+".dat");
+	ofstream ff7("./outputs/Q_VT_"+sinout+".dat");
+	ofstream ff8("./outputs/XT_VT_"+sinout+".dat");
+	//ifstream ff9("X_tg"+sinout+".dat"); //cgfn con la nuova impostazione, lo leggo dallo stesso file da cui leggo il flusso
+	ofstream ff11("./outputs/Power_VT_"+sinout+".dat"); // (caf 17/05/2018)
+	ff11 << "% tile\tSource [W/m]\tTo coolant [W/m]\tTo coolant [%]\tTo LM [W/m]\tTo LM [%]" << endl;
+	ofstream ff12("./outputs/mev_VT_"+sinout+".dat"); // (caf 17/05/2018)
+	
+	real X;
+	TTMAX=0.0;
+
+	for(int itile=0;itile<Ntile;itile+=1)
+	{
+		ff1 << TmaxCCZ(itile) << endl;
+		ff10 << TmaxCPS(itile) << endl;
+		if (TmaxCPS(itile)>=TCMAX)
+		{
+			TCMAX=TmaxCPS(itile);
+			ICMAX=itile;
+		}
+		ff2 << TmaxCU(itile) << endl;
+		ff3 << TmaxW(itile) << endl;
+		if (TmaxW(itile)>=TTMAX)
+		{
+			TTMAX=TmaxW(itile);
+			IMAX=itile;
+		}
+		ff4 << Twater(itile) << endl;
+		for (int kk=1;kk<npointout;kk+=1)
+		{
+			ff6 << Tout(itile,kk-1) << " ";
+		}
+		ff6 << Tout(itile,npointout-1) << endl;
+		ff7 << Qreal(itile) << endl;
+		if (!dbg){ // (caf 15/05/2018)
+			//ff9 >> X; //cgfn uso in modo differente la X
+			ff8 << X << "\t" << TmaxCCZ(itile) << "\t" << TmaxCU(itile) << "\t" << TmaxW(itile) << "\t" << Qreal(itile) << endl;
+			//ff9 >> X; ff9>>X; //cgfn uso in modo differente la X
+		} // end if dbg (caf 15/05/2018)
+		ff11 << itile << "\t" << Qin(itile) << "\t" << Qcool(itile) << "\t" << Qfcool(itile) << "\t" << Qlm(itile) << "\t" << Qflm(itile) << endl; // (caf 17/05/2018)
+		ff12 << Mev(itile) << endl; // (caf 17/05/2018)
+	}
+}
+*/
+cout << "Maximum CPS temperature is " << TCMAX << " C at cut number " << ICMAX << endl;
+cout << "Maximum W temperature is " << TTMAX << " C at cut number " << IMAX << endl;
+cout << "Water outlet temperature is " << Twater(Ntile-1) << " C" << endl;
+
+
+/////////////////////////////////////////////////////////////////////////////////////////
+////CGFN FIXME sto modificando per aggiungere parte transitoria//////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////
+if (itruetrans == 1) {
+	cout << "****************************" << endl;
+	cout << "Transient calculation starts" << endl;
+	cout << "****************************" << endl;
+	itrans=1; 
+}
+
+int ifirstcall=1;
+
+while (itruetrans==1) //cgfn con questa condizione mi assicuro che il ciclo risolutivo parta solo in caso di vero transitorio, ed ho una strategia per farlo terminare a partire dal master (SOLPS) 
+{
+	//cgfn queste righe di codice sostituiscono la chiamata dello script wait001.exe, che non gira su UNIX
+	{
+	ifstream istart("./exchange/istop.dat");
+	istart >> itruetrans;
+	cout << "itruetrans=" << itruetrans << endl << endl << endl;
+	}
+
+	real waittime=0.005; //pausa di 5 ms
+        bool exists=false;
+
+    real maxtime=100; //tempo max di attesa per iterazione di B2
+    					//5 OK per Li
+    real elaptime=0;
+	while (exists==false && elaptime<maxtime) //controllo su elaptime solo al primo passo
+	{
+		try {
+			ifstream ffem("./exchange/run_freefem.dat");
+			if (ffem.good())
+				exists=true;
+		} 
+		catch(...) {
+		exec("sleep 0.05");
+		
+		elaptime=elaptime+0.05;
+
+		cout << "elaptime=" << elaptime << endl;
+		} //per ora non uso il valore di waittime, dovrei concatenare stringa
+//cgfn si ricordi che il waittime serve a dare tempo a fortran di aprire run_freefem.dat, di scrivere il valore di dt e di chiudere il file.
+	}//while (exists==false) 
+
+	if (elaptime>maxtime)
+		break;
+
+	//FIXME qui andrebbe verbosity associata al passo di tempo che sta per iniziare per ogni tile
+
+	{
+	ifstream ffem("./exchange/run_freefem.dat");
+	ffem >> dt;
+	}
+	time += dt;
+	cout << "time= " << time << endl;
+
+	//Ciclo per leggere file contenente carico termico al passo di tempo attuale
+	ifstream www1("./exchange/ft3dr.last10.rt"); //cgfn sto leggendo file con carico termico totale
+	{
+	// FIXME separare inner ed outer divertor, che leggeranno da file differenti
+	for(int itile=0; itile<Ntile; itile+=1)
+	{
+		if (!dbg) // (caf 04/05/2018)
+		{
+			//ifstream www1("Wtot_tg"+sinout+".dat"); cgfn leggo da un unico file
+			//ifstream www2("Wpls_tg"+sinout+".dat");
+
+			//www1 >> qtot(nn);
+			//www2 >> qpls(nn);
+
+			www1 >> X(itile) >> qpls(itile);
+			//cgfn taglio a zero il carico termico sui tiles piu' lontani. Per inboard divertor i carichi validi sono <0, gli altri vanno tagliati a zero. Al contrario, per outboard divertor i carichi validi sono >0, gli altri vanno tagliati a zero.
+			if (inout==1 && qpls(itile)>0.)
+				qpls(itile)=0.;
+			else if (inout==0 && qpls(itile)<0.)
+				qpls(itile)=0.;
+			
+			cout << "	Tile number " << itile << ": " << "X=" << X(itile) << " (m); qtot=" << qpls(itile) << " (W/m^2)" <<endl;
+			qtot(itile)=qpls(itile); //cgfn per ora non distinguo fra carico di plasma e carico totale
+
+		} else { // (caf 04/05/2018)
+			//qtot(nn) = 1e6;
+			//qpls(nn) = 1e6;
+			www1 >> X(itile) >> qpls(itile);
+			//cgfn taglio a zero il carico termico sui tiles piu' lontani. Per inboard divertor i carichi validi sono <0, gli altri vanno tagliati a zero. Al contrario, per outboard divertor i carichi validi sono >0, gli altri vanno tagliati a zero.
+			if (inout==1 && qpls(itile)>0.)
+				qpls(itile)=0.;
+			else if (inout==0 && qpls(itile)<0.)
+				qpls(itile)=0.;
+			cout << "	Tile number " << itile << ": " << "X=" << X(itile) << " (m); qtot=" << qpls(itile) << " (W/m^2)" <<endl;
+			qtot(itile)=qpls(itile); //cgfn per ora non distinguo fra carico di plasma e carico totale
+		}
+	
+	} // for(int nn=0; nn<Ntile; nn+=1)
+	} //ifstream
+
+	//ciclo principale (ancora sui tiles, ma per calcolo e non piu' per lettura carico in input)
+	for(int itile=0;itile<Ntile;itile+=1)
+	{
+		Told=Toldtile[itile]; //in questo modo tengo invariata la struttura del ciclo. Al primo passo di tempo, prendo come profilo iniziale di temperatura quello calcolato sul tile nella fase stazionaria del calcolo. Per i passi di tempo successivi, procedo come di consueto nei transitori.
+		if (dbg && !grid)
+		{
+			ofstream ffdbg("./debug/tmaxdbg"+(itile+1)+".log");
+			ffdbg << "% iter\tunderrel\tTmax\terrmev_old\terrmev_new\terr" << endl;
+		}
+		qq=(qpls(itile)/cos(beta+alpha))*(x>=Xshadow)+(qtot(itile)-qpls(itile));
+		Qreal(itile)=qpls(itile)/cos(beta+alpha)+qtot(itile)-qpls(itile);
+		real err,tol=1.e-6, tolmev=1e-4;
+		/*if (itrans==1)
+		{
+			Told=Tf;
+		}*/ //cgfn
+
+		if (verb > 0)
+		{
+			cout << endl;
+			cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+			cout << "tile number " << itile << endl;
+			cout << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << endl;
+			cout << "psat = " << int1d(block,CLM)(psatLM(TrefLM))/int1d(block,CLM)(1.0) << " Pa" << endl;
+			cout << "qq= " << qq[] << endl;
+			cout << "Qreal(itile)= " << Qreal(itile) << endl;
+			cout << "qpls(itile)= " << qpls(itile) << endl;
+		}
+		real qwater=0.0,qplasma=0.0;
+		// Solve pseudo transient on the single tile
+		/*int ii=0;
+		real tttt = 1.0;
+		if (itrans == 0)
+		{
+			tttt = min(2e17/(qtot(itile)^3+epsilon),0.04); // relaxation parameter on mev
+		}
+		bool conv = false; // convergence flag (caf 16/05/2018)
+		time = 0;
+		*/
+		//cgfn aggiungo, ma il dt devo leggerlo da fuori
+		//time += dt; cgfn ho anticipato questa menzione a prima del ciclo sui tiles.
+		//while (!conv && ii<ITERMAX)
+		//{
+		//	if (itrans == 1)
+		//	{
+		//		time += dt;
+		//	}
+			// caf 23/05/2015 redefine properties with macros
+			/*kCCZ=CCZ(0)*T^3.0+CCZ(1)*T^2.0+CCZ(2)*T+CCZ(3);
+			kCu=CU(0)*T^3.0+CU(1)*T^2.0+CU(2)*T+CU(3);
+			kW=WW(0)*T^5.0+WW(1)*T^4.0+WW(2)*T^3.0+WW(3)*T^2.0+WW(4)*T+WW(5);
+			klm=LMk(0)*(T+273.15)^2.0+LMk(1)*(T+273.15)+LMk(2); // caf add 15/05/2018*/
+		kCCZ = kfCCZ(Told);
+		kCu = kfCU(Told);
+		kW = kfW(Told);
+		klm = kfLM(Told);
+		rhoCCZ = rhofCCZ(Told);
+		rhoCu = rhofCU(Told);
+		rhoW = rhofW(Told);
+		rholm = rhofLM(Told);
+		cpCCZ = cpfCCZ(Told);
+		cpCu = cpfCU(Told);
+		cpW = cpfW(Told);
+		cplm = cpfLM(Told);
+		fmlm = rholm/(rholm+rhoW*alphaCPS);
+		if (iCPSs == 1) // caf add 15/05/2018
+		{
+		//cgfn FIXME verificare che i pesi scelti (frazione volumica e massica, rispettivamente) siano adeguati.
+			kCPS = fvlm*klm + (1-fvlm)*kW; // from T. W. Morgan et al., Power handling of a liquid-metal based CPS structure under high steady-state heat and particle fluxes, Nucl. Mat. En. 12, pp. 210-215 (2017)
+			rhoCPS = fvlm*rholm + (1-fvlm)*rhoW; // from T. W. Morgan et al., Power handling of a liquid-metal based CPS structure under high steady-state heat and particle fluxes, Nucl. Mat. En. 12, pp. 210-215 (2017)
+			cpCPS = fmlm*cplm + (1-fmlm)*cpW; // from T. W. Morgan et al., Power handling of a liquid-metal based CPS structure under high steady-state heat and particle fluxes, Nucl. Mat. En. 12, pp. 210-215 (2017)
+		} else { // add additional CPS conductivity definitions in elseif branches here
+			cerr << "CPS mesh materials other than W (I_CPS_SOL = 1) not yet implemented" << endl;
+			exit(1); // should never get here, as this check was performed when reading input
+		}
+		K=kW*(region==ww)+kCu*(region==cu)+kCCZ*(region==ccz)+kCPS*(region==cps);
+		rho=rhoW*(region==ww)+rhoCu*(region==cu)+rhoCCZ*(region==ccz)+rhoCPS*(region==cps);
+		cp=cpW*(region==ww)+cpCu*(region==cu)+cpCCZ*(region==ccz)+cpCPS*(region==cps);
+		//htc=(2.1415e-3*(T^3.0)-1.2231*(T^2.0)+2.6941e2*T+5.6162e+04)*(T<270.0)+(-2.6549e-07*(T^5.0)+4.6179e-04*(T^4.0)-0.32055*(T^3.0)+2.4134e2*(T^2.0)-8.9665e+04*T+1.0945e+07)*(T>=270.0); // caf 23/05/2018 redefine properties with macros
+		htc = fhtc(Told);
+		mav = int1d(block,CLM)(mev)/LMth;
+		//hL = hLM(0) + hLM(1)*(T+273.15); // caf 23/05/2018 redefine properties with macros
+		hL = hfLM(Told);
+		if (dbg && !grid)
+		{
+			if (verb > 0){
+				if (time>0.)
+				{
+					cout << "average psat = " << int1d(block,CLM)(psatLM(Told))/int1d(block,CLM)(1.0) << " Pa" << endl;
+				}
+				cout << "average mev = " << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << " kg/(m2 s)" << endl;
+				cout << "mav = " << mav << " kg/(m2 s)" << endl;
+				if (verb > 1)
+				{
+					plot(K,fill=1,value=1,wait=1,cmm="K");
+					plot(rho,fill=1,value=1,wait=1,cmm="rho");
+					plot(cp,fill=1,value=1,wait=1,cmm="cp");
+					plot(htc,fill=1,value=1,wait=1,cmm="h");
+					plot(mev,fill=1,value=1,wait=1,cmm="mev");
+					plot(hL,fill=1,value=1,wait=1,cmm="hL");
+					/*int asp;
+					cin >> asp;*/
+				}
+			}
+		cout << "Solve time " << dt << endl << endl;
+		} // if (dbg && !grid)
+
+		divert; //Risolvo problema transitorio
+
+		Toldtile[itile]=T; //store solution for next timestep
+
+		if (verb > 1)
+		{
+			plot(T,fill=1,value=1,wait=1,cmm="T");
+			/*int asp;
+			cin >> asp;*/
+		} // if (verb > 1)
+
+		if (dbg && !grid) //cgfn FIXME forse inutile
+		{
+			if (verb > 0)
+			{
+				errmev = sqrt(int1d(block,CLM)((dmev)^2.0))/sqrt(int1d(block,CLM)(mev^2.0));
+				enerrA = abs(ensource+eninLM-enoutLM-enoutcool);
+				enerrR = enerrA/(ensource+epsilon);
+				cout << "Energy source = " << ensource << " W/m" << endl;
+				cout << "Energy flux in via LM = " << eninLM << " W/m" << endl;
+				cout << "Energy flux out via LM = " << enoutLM << " W/m" << endl;
+				cout << "Energy flux out via coolant = " << enoutcool << " W/m" << endl;
+				//cout << "Abs error on energy conservation = " << enerrA << " W/m" << endl;
+				//cout << "Rel error on energy conservation = " << enerrR*100 << " %" << endl;
+				cout << "Rel diff on mev (old) = " << errmev << endl;
+				cout << "Rel diff on mev (new) = " << errmevnew << endl;
+				cout << "Rel error on fixed-point = " << err << endl;
+			} // if (verb > 0)
+			//ofstream ffdbg("./debug/tmaxdbg"+(itile+1)+".log",append);
+			//ffdbg << ii << "\t" << tttt << "\t" << T[].max << "\t" << errmev << "\t" << errmevnew << "\t" << err << endl;
+		} //if (dbg && !grid)
+
+		ofstream fftrans("./outputs/transient_out_tile"+itile+".dat",append);  //cgfn FIXME forse inutile
+		fftrans << time << "\t" << T[].max << "\t" << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << "\t" << endl;
+
+		//cout << itile << endl;
+		Qin(itile) = ensource;
+		Qcool(itile) = enoutcool;
+		Qlm(itile) = enoutLM-eninLM;
+		Qfcool(itile) = enoutcool*100/(ensource+epsilon);
+		Qflm(itile) = Qlm(itile)*100/(ensource+epsilon);
+		Mev(itile) = int1d(block,CLM)(mev)/int1d(block,CLM)(1.0); // uses relaxed value
+	
+		Twater(itile)=Tf;
+		HTC(itile)=int1d(block,GG)(htc)/int1d(block,GG)(1.0);
+	
+		// Evaluate next T bulk
+		qwater=(-int1d(block,GG)(htc*Tf)+int1d(block,GG)(htc*T))*2.0*Ltile;
+		Tf=Tf+qwater/mflow/cpw;
+	
+		// Check for CHF (40 MW/m^2)
+		HF=htc*(T-Tf);
+		hfmax=0.0;
+		for (int ii=0;ii<=npoints;ii+=1.0)
+		{
+			gamma=ii/npoints*pi/2.0;
+			hflux=HF(L/2.+D3/2.*cos(pi/2.-gamma),H+D3/2.*sin(pi/2.-gamma));
+			if(hflux>=hfmax){
+				hfmax=hflux;
+			}
+		}
+	
+		if(hfmax>=CHF)
+		{
+			ff02 << "Warning! Reached critical heat flux of "<< CHF <<" W/m^2. Tile number " << itile <<endl;
+			flag=-9.0;
+		}
+	
+		//Output delle temperature, per il tile appena calcolato, nei punti richiesti
+		for (int ii=1;ii<=npointout;ii+=1)
+		{
+			Tout(itile,ii-1)=T(Lout(ii-1),L1+(Lout(ii-1)-L)*tan(beta));
+		}
+	
+		Tmax(itile)=T[].max;
+		if (Tmax(itile)>=TTMAX)
+		{
+			TTMAX=Tmax(itile);
+			TMAX=T;
+		}
+	
+		TTT=0.0*(region==ww)+0.0*(region==ccz)+T*(region==cu)+0.0*(region==cps);
+		TmaxCU(itile)=TTT[].max;
+		if(TmaxCU(itile)>700.0)
+		{
+			ff02 << "Warning! Cu temperature exceeds properties range of 700 C. Tile number " << itile << " T_Cu= " << TmaxCU(itile) << " C" <<endl;
+			flag=-9.0;
+		}
+		TTT=T*(region==ww)+0.0*(region==ccz)+0.0*(region==cu)+0.0*(region==cps);
+		TmaxW(itile)=TTT[].max;
+		if(TmaxW(itile)>3200.0)
+		{
+			ff02 << "Warning! W temperature exceeds properties range of 3200 C. Tile number " << itile << " T_W= " << TmaxW(itile) << " C" <<endl;
+			flag=-9.0;
+		}
+		TTT=0.0*(region==ww)+T*(region==ccz)+0.0*(region==cu)+0.0*(region==cps);
+		TmaxCCZ(itile)=TTT[].max;
+		if(TmaxCCZ(itile)>433.0){
+			ff02 << "Warning! CuCrZr temperature exceeds properties range of 433 C. Tile number " <<itile<<" T_CCZ= "<< TmaxCCZ(itile)<<" C" <<endl;
+			flag=-9.0;
+		}
+		TTT=0.0*(region==ww)+0.0*(region==ccz)+0.0*(region==cu)+T*(region==cps);
+		TmaxCPS(itile)=TTT[].max;
+		if(TmaxCPS(itile)>3200.0){
+			ff02 << "Warning! CPS temperature exceeds properties range of 3200 C. Tile number " <<itile<<" T_CPS= "<< TmaxCPS(itile)<<" C" <<endl;
+			flag=-9.0;
+		}
+		//if (!autogrid)
+		//{
+			//plot(T,fill=1,value=1);
+			//if (itile==iplot)
+			//{
+			//	string name = "./plots/Temp2D_VT_"+sinout+"_" + (itile+1) + ".eps";
+			//	plot(T,fill=1,value=1,ps=name);
+			//	iplot=iplot+nplots;
+			//}
+		//}
+	}// for(int itile=0;itile<Ntile;itile++) end loop on monoblock length
+
+	string name;
+	if (!grid)
+	{
+		name = "./plots/Temp2D_VT_"+sinout+"_" + Ntile + ".eps";
+	} else {
+		name = "./plots/Temp2D_VT_"+sinout+"_" + Ntile + "_n" + n + ".eps";
+	} // if (!grid)
+
+	//if (!autogrid)
+	//{
+		//plot(T,fill=1,value=1,ps=name);
+	//} // if (!autogrid)
+
+	if (!grid)
+	{
+		name = "./plots/Temp2D_VT_"+sinout+"_MAX.eps";
+	} else {
+		name = "./plots/Temp2D_VT_"+sinout+"_n"+n+"_MAX.eps";
+	}
+	if (!autogrid)
+	//{
+		//plot(TMAX,fill=1,value=1,ps=name);
+	//}
+
+	if (!grid) // caf 17/05/2018 reduce output footprint for grid independence
+	{
+		//ofstream ff1("./outputs/T_CCZ_VT_"+sinout+".dat");
+		//ofstream ff10("./outputs/T_CPS_VT_"+sinout+".dat");
+		//ofstream ff2("./outputs/T_Cu_VT_"+sinout+".dat");
+		//ofstream ff3("./outputs/T_W_VT_"+sinout+".dat");
+		//ofstream ff4("./outputs/T_water_VT_"+sinout+".dat");
+		//ofstream ff6("./outputs/Tout_VT_"+sinout+".dat");
+		//ofstream ff7("./outputs/Q_VT_"+sinout+".dat");
+		//ofstream ff8("./outputs/XT_VT_"+sinout+".dat");
+		//ifstream ff9("X_tg"+sinout+".dat"); //cgfn con la nuova impostazione, lo leggo dallo stesso file da cui leggo il flusso
+		//ofstream ff11("./outputs/Power_VT_"+sinout+".dat"); // (caf 17/05/2018)
+		//ff11 << "% tile\tSource [W/m]\tTo coolant [W/m]\tTo coolant [%]\tTo LM [W/m]\tTo LM [%]" << endl;
+		//ofstream ff12("./outputs/mev_VT_"+sinout+".dat"); // (caf 17/05/2018)
+	
+		real X;
+		TTMAX=0.0;
+		
+		for(int itile=0;itile<Ntile;itile+=1)
+		{
+			/*ff1 << TmaxCCZ(itile) << endl;
+			ff10 << TmaxCPS(itile) << endl;
+			if (TmaxCPS(itile)>=TCMAX)
+			{
+				TCMAX=TmaxCPS(itile);
+				ICMAX=itile;
+			}
+			ff2 << TmaxCU(itile) << endl;
+			ff3 << TmaxW(itile) << endl;
+			if (TmaxW(itile)>=TTMAX)
+			{
+				TTMAX=TmaxW(itile);
+				IMAX=itile;
+			}
+			ff4 << Twater(itile) << endl;
+			for (int kk=1;kk<npointout;kk+=1)
+			{
+				ff6 << Tout(itile,kk-1) << " ";
+			}
+			ff6 << Tout(itile,npointout-1) << endl;
+			ff7 << Qreal(itile) << endl;
+			if (!dbg){ // (caf 15/05/2018)
+				//ff9 >> X; //cgfn uso in modo differente la X
+				ff8 << X << "\t" << TmaxCCZ(itile) << "\t" << TmaxCU(itile) << "\t" << TmaxW(itile) << "\t" << Qreal(itile) << endl;
+				//ff9 >> X; ff9>>X; //cgfn uso in modo differente la X
+			} // end if dbg (caf 15/05/2018)
+			ff11 << itile << "\t" << Qin(itile) << "\t" << Qcool(itile) << "\t" << Qfcool(itile) << "\t" << Qlm(itile) << "\t" << Qflm(itile) << endl; // (caf 17/05/2018)
+			ff12 << Mev(itile) << endl; // (caf 17/05/2018)
+			//cgfn aggiungo calcolo della temperatura equivalente del tile
+			//che sara' poi quello che verra' passato a fortran
+			*/
+			//cgfn FIXME FIXME FIXME essendo non lineare, non basta la temperatura media sul bordo superiore del tile, ma dovrei calcolare la temperatura tale da avere un rateo di evaporazione pari a quello medio. Per ora la calcolo come una media semplice, ma una bozza di metodo di Newton per risolvere il problema viene qui proposta (commentata).
+                        //Tave(itile)=int1d(block,CLM)(Toldtile[itile])/int1d(block,CLM)(1.0);
+			real errNewt=1;
+			real tolNewt=1E-3;
+			int maxItNewt=100;
+			real TempOld=Tmax(itile); //cgfn inizializzo con un buon guess
+			real Temp=0.0;
+			int nItNewt=0;
+			real mevIntegrata;
+			real mevATMedia;
+			int maxItNewton;
+
+			while (errNewt>tolNewt && nItNewt<100)
+			{
+				//cgfn FIXME per ora la faccio sporca e hardcodo la formula
+				real INTEGR=int1d(block,CLM)(PMLM*eta*(psatLM(Toldtile[itile])/sqrt(2.0*pi*PMLM*R0*(Toldtile[itile]+273.15))));
+		        	real ffnewt=10^(-8064.5/(TempOld+273.15))/sqrt(TempOld+273.15)-INTEGR/L/PMLM/eta*sqrt(2.0*pi*PMLM*R0)/10^10.015;
+				real ffder=10^(-8064.5/(TempOld+273.15))/(TempOld+273.15)*(8064.5/((TempOld+273.15)^(3/2))-1/sqrt(TempOld+273.15));
+			    	Temp=TempOld-ffnewt/ffder;
+			    	nItNewt=nItNewt+1;
+				mevIntegrata = int1d(block,CLM)(PMLM*eta*(psatLM(Toldtile[itile])/sqrt(2.0*pi*PMLM*R0*(Toldtile[itile]+273.15))));
+				mevATMedia =   L*PMLM*eta*(psatLM(Temp)/sqrt(2.0*pi*PMLM*R0*(Temp+273.15)));
+			    	//errNewt=abs((TempOld-Temp)/TempOld);
+				errNewt=abs(mevIntegrata-mevATMedia)/mevIntegrata; //calcolo errore sulla quantita che sono interessato a conservare
+			    	TempOld=Temp;
+				//cout << "iteration " << nItNewt << "TempOld " << TempOld << endl;
+			}
+			if (nItNewt==100)
+			{
+				cout << "max number of iteration in Newton method exceeded" << endl;
+			}
+			Tave(itile)=Temp;
+			//cgfn FIXME questo andra' incluso in un if (dbg)
+			//cout << "Number of iterations for newton " << nItNewt << endl;
+			//cout << "Tile " << itile << "Tmax " << Tmax(itile) << "Taveave " << Taveave(itile) << endl;
+			//mevIntegrata = int1d(block,CLM)(PMLM*eta*(psatLM(Toldtile[itile])/sqrt(2.0*pi*PMLM*R0*(Toldtile[itile]+273.15))));
+			//mevATMedia =   L*PMLM*eta*(psatLM(Taveave(itile))/sqrt(2.0*pi*PMLM*R0*(Taveave(itile)+273.15)));
+			//cout << "mev(Teq)= " << mevIntegrata << "mevint=" << mevATMedia << endl;	
+			//cgfn END FIXME FIXME FIXME	 
+		} //for(int itile=0;itile<Ntile;itile+=1)
+	} // if (!grid) 
+	exec(" rm ./exchange/fromfreef.dat");
+	{ // open fromfreef.dat
+	ofstream res("./exchange/fromfreef.dat"); //write variables to be read by FORTRAN
+		for (int itile=0;itile<Ntile;itile+=1)
+		{
+			res << Tave(itile)+273.15 << endl;
+			cout << Taveave(itile) << Tave(itile) << " " << Tmax(itile) << endl;
+			//cgfn FIXME temporary
+			//name = "./plots/Temp2D_VT_"+sinout+"_" + itile + "time" + time + ".eps";
+			//plot(T,fill=1,value=1,ps=name);
+		} // for (int itile=1;itile<Ntile;itile+=1)
+	} // close fromfreef.dat
+	//exec("sleep(100)");
+	//exec ("rm ../b2mn.exe.dir/run_freefem.dat"); //questo comando fa partire l'iterazione successiva in SOLPS-ITER
+        /*{ // open fromfreef.dat in local folder
+	ofstream ress("fromfreef.dat");
+		for (int itile=0;itile<Ntile;itile+=1)
+                {
+                        ress << Tave(itile)+273.15 << endl;
+                        //cout << Taveave(itile) << Tave(itile) << " " << Tmax(itile) << endl;
+                        //cgfn FIXME temporary
+                        //name = "./plots/Temp2D_VT_"+sinout+"_" + itile + "time" + time + ".eps";
+                        //plot(T,fill=1,value=1,ps=name);
+                } // for (int itile=1;itile<Ntile;itile+=1)
+	} // close fromfreef.dat
+	*/
+	//cgfn ora salvo flussi termici e temperature in risposta
+
+	for (int itile=0; itile<Ntile; itile+=1)
+	{
+	ofstream fftrans1("./outputs/transient_verif_tile"+itile+".dat",append);  //cgfn FIXME forse inutile
+		     fftrans1 << time << "\t" << Tave(itile)+273.15 << "\t" << qpls(itile)  << "\t" << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << "\t" << int1d(block,CLM)(mev) << endl;
+	}//close file for output and for loop
+	exec("sleep 0.05");
+    exec ("rm ./exchange/run_freefem.dat"); //questo comando fa partire l'iterazione successiva in SOLPS-ITER
+
+    ifirstcall=0;
+
+} // while (itruetrans==1) 
+
+cout << "FreeFem++ calculation completed" << endl << endl;
+//cout << "Maximum CPS temperature is " << TCMAX << " C at cut number " << ICMAX << endl;
+//cout << "Maximum W temperature is " << TTMAX << " C at cut number " << IMAX << endl;
+cout << "Water outlet temperature is " << Twater(Ntile-1) << " C" << endl;
+
+/////////////////////////////////////////////////////////////////////////////////////////
+////CGFN FIXME fine modifica per aggiungere parte transitoria//////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////
+
+if (grid)
+{
+	ofstream gridout("grid.dat",append);
+	gridout.precision(16);
+	gridout << n << "\t" << Mev(Ntile-1) << "\t" << TmaxCPS(Ntile-1) << "\t" << TmaxW(Ntile-1) << "\t" << TmaxCCZ(Ntile-1) << "\t" << TmaxCU(Ntile-1) << "\t" << Twater(Ntile-1) << "\t" << Qflm(Ntile-1) << endl;
+}
+
+if(flag<0.0)
+{
+	cout << "WARNING! Something went wrong, please check the file 'warning.log' for details" << endl;
+}
+
+//} //close files
