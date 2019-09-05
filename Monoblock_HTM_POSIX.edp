@@ -1,3 +1,15 @@
+load "ff-mmap-semaphore"
+
+Psemaphore smff("ff-slave1",0);
+Psemaphore smc("ff-master1",0);
+Pmmap sharedata("shared-data",1024);
+
+int statusff = 1;
+//cgfn dummy values for the moment
+//real cff, rff;
+cout << "FreeFem++: sono bloccato" << endl;
+Wait(smc);
+cout << "FreeFem++: sono libero" << endl;
 /*
  * SIMPLIFIED MONOBLOCK HEAT TRANSFER MODEL
  *
@@ -401,22 +413,28 @@ real[int] X(Ntile); //cgfn le coordinate vengono lette dal medesimo file da cui 
 //cgfn FIXME se modifico questa lettura sotto, devo essere coerente anche qui sopra
 //cgfn attendo fino a che il file non e' prodotto 
 
-cout << "**********************************************************" << endl; 
-cout << "Attendo file ft3dr.last10.rt per iniziare calcolo stazionario" << endl; 
-cout << "**********************************************************" << endl; 
-bool exists=false;
+//cout << "**********************************************************" << endl; 
+//cout << "Attendo file ft3dr.last10.rt per iniziare calcolo stazionario" << endl; 
+//cout << "**********************************************************" << endl; 
+//bool exists=false;
+//
+//while (exists==false)
+//{
+//	try {
+//		ifstream ffem("./exchange/ft3dr.last10.rt");
+//		if (ffem.good())
+//			exists=true;
+//	} 
+//	catch(...) {exec("sleep 0.01");} //per ora non uso il valore di waittime, dovrei concatenare stringa
+//	//catch(...) {exec("usleep 10");}
+////cgfn si ricordi che il waittime serve a dare tempo a fortran di aprire run_freefem.dat, di scrivere il valore di dt e di chiudere il file.
+//}//while (exists==false) 
 
-while (exists==false)
-{
-	try {
-		ifstream ffem("./exchange/ft3dr.last10.rt");
-		if (ffem.good())
-			exists=true;
-	} 
-	catch(...) {exec("sleep 0.01");} //per ora non uso il valore di waittime, dovrei concatenare stringa
-	//catch(...) {exec("usleep 10");}
-//cgfn si ricordi che il waittime serve a dare tempo a fortran di aprire run_freefem.dat, di scrivere il valore di dt e di chiudere il file.
-}//while (exists==false) 
+//cgfn qui aspetto di avere a disposizione il file ft3dr.last10.rt
+//allora metto un semaforo fino a quando il file non viene realmente creato in SOLPS
+
+
+
 cout << "**********************************************************" << endl; 
 cout << "Trovato file ft3dr.last10.rt per iniziare calcolo stazionario" << endl; 
 cout << "**********************************************************" << endl; 
@@ -1228,12 +1246,37 @@ for(int itile=0;itile<Ntile;itile++)
 	
 
 //6.2 Scrivo output in modo che octave o SOLPS-ITER inizino il loro calcolo
+	real TaveK; 
+Post(smff); //unlock cc
 
-{
-ofstream res("./exchange/fromfreef.dat"); //write variables to be read by FORTRAN
-for (int itile=1;itile<Ntile;itile+=1)
-	res << Tmax(itile);
-} // close fromfreef.dat
+cout << "FF: inizializzazione finita" << endl;
+for (int itile=0;itile<Ntile;itile+=1)
+	{
+	if (verbosity > 9) cout << "FF: before FF wait \n";
+	Wait(smc); //wait from cint write ok
+	//Read(sharedata, 0, Tave(itile)+273.15 );
+	Read(sharedata, 8, statusff);
+
+	cout << " After wait .. FF " << statusff << endl;
+	//if(statusff <= 0) break;
+
+	//Write
+	TaveK=Tave(itile)+273.15;
+	cout << "#tile=" << itile << " " << "Tave=" << Tave(itile) << " " << "TaveK=" << TaveK << endl;
+	Write(sharedata, 16, TaveK);
+	Post(smff); //unlock cc
+	}
+    cout << "*****************************************" << endl;
+	cout << "FreeFem++: fuori da ciclo di lettura init" << endl;
+    cout << "*****************************************" << endl;
+    cout << "*****************************************" << endl;
+    cout << "*****************************************" << endl;
+    cout << "*****************************************" << endl;   	
+//{
+//ofstream res("./exchange/fromfreef.dat"); //write variables to be read by FORTRAN
+//for (int itile=1;itile<Ntile;itile+=1)
+//	res << Tmax(itile) << endl;
+//} // close fromfreef.dat
 
 string name;
 if (!grid)
@@ -1326,14 +1369,14 @@ if (itruetrans == 1) {
 
 int ifirstcall=1;
 
-while (itruetrans==1) //cgfn con questa condizione mi assicuro che il ciclo risolutivo parta solo in caso di vero transitorio, ed ho una strategia per farlo terminare a partire dal master (SOLPS) 
+while (1) //cgfn con questa condizione mi assicuro che il ciclo risolutivo parta solo in caso di vero transitorio, ed ho una strategia per farlo terminare a partire dal master (SOLPS) 
 {
 	//cgfn queste righe di codice sostituiscono la chiamata dello script wait001.exe, che non gira su UNIX
-	{
-	ifstream istart("./exchange/istop.dat");
-	istart >> itruetrans;
-	cout << "itruetrans=" << itruetrans << endl << endl << endl;
-	}
+	//{
+	//ifstream istart("./exchange/istop.dat");
+	//istart >> itruetrans;
+	//cout << "itruetrans=" << itruetrans << endl << endl << endl;
+	//}
 
 	real waittime=0.005; //pausa di 5 ms
         bool exists=false;
@@ -1341,34 +1384,39 @@ while (itruetrans==1) //cgfn con questa condizione mi assicuro che il ciclo riso
     real maxtime=100; //tempo max di attesa per iterazione di B2
     					//5 OK per Li
     real elaptime=0;
-	while (exists==false && elaptime<maxtime) //controllo su elaptime solo al primo passo
-	{
-		try {
-			ifstream ffem("./exchange/run_freefem.dat");
-			if (ffem.good())
-				exists=true;
-		} 
-		catch(...) {
-		exec("sleep 0.05");
-		
-		elaptime=elaptime+0.05;
 
-		cout << "elaptime=" << elaptime << endl;
-		} //per ora non uso il valore di waittime, dovrei concatenare stringa
-//cgfn si ricordi che il waittime serve a dare tempo a fortran di aprire run_freefem.dat, di scrivere il valore di dt e di chiudere il file.
-	}//while (exists==false) 
+    Wait(smc);
 
-	if (elaptime>maxtime)
-		break;
+	Read(sharedata, 8, statusff);
+	if(statusff <= 0) break;
+//	while (exists==false && elaptime<maxtime) //controllo su elaptime solo al primo passo
+//	{
+//		try {
+//			ifstream ffem("./exchange/run_freefem.dat");
+//			if (ffem.good())
+//				exists=true;
+//		} 
+//		catch(...) {
+//		exec("sleep 0.05");
+//		
+//		elaptime=elaptime+0.05;
+//
+//		cout << "elaptime=" << elaptime << endl;
+//		} //per ora non uso il valore di waittime, dovrei concatenare stringa
+////cgfn si ricordi che il waittime serve a dare tempo a fortran di aprire run_freefem.dat, di scrivere il valore di dt e di chiudere il file.
+//	}//while (exists==false) 
+
+	//if (elaptime>maxtime)
+	//	break;
 
 	//FIXME qui andrebbe verbosity associata al passo di tempo che sta per iniziare per ogni tile
 
-	{
-	ifstream ffem("./exchange/run_freefem.dat");
-	ffem >> dt;
-	}
-	time += dt;
-	cout << "time= " << time << endl;
+	//{
+	//ifstream ffem("./exchange/run_freefem.dat");
+	//ffem >> dt;
+	//}
+	//time += dt;
+	//cout << "time= " << time << endl;
 
 	//Ciclo per leggere file contenente carico termico al passo di tempo attuale
 	ifstream www1("./exchange/ft3dr.last10.rt"); //cgfn sto leggendo file con carico termico totale
@@ -1830,8 +1878,10 @@ while (itruetrans==1) //cgfn con questa condizione mi assicuro che il ciclo riso
 			//cgfn END FIXME FIXME FIXME	 
 		} //for(int itile=0;itile<Ntile;itile+=1)
 	} // if (!grid) 
-	exec(" rm ./exchange/fromfreef.dat");
+	//exec(" rm ./exchange/fromfreef.dat");
+	/*
 	{ // open fromfreef.dat
+	
 	ofstream res("./exchange/fromfreef.dat"); //write variables to be read by FORTRAN
 		for (int itile=0;itile<Ntile;itile+=1)
 		{
@@ -1842,6 +1892,25 @@ while (itruetrans==1) //cgfn con questa condizione mi assicuro che il ciclo riso
 			//plot(T,fill=1,value=1,ps=name);
 		} // for (int itile=1;itile<Ntile;itile+=1)
 	} // close fromfreef.dat
+	*/
+
+	Post(smff);
+    for (int itile=0;itile<Ntile;itile+=1)
+    	{
+		if (verbosity > 9) cout << "FF: before FF wait \n";
+		Wait(smc); //wait from cint write ok
+		//Read(sharedata, 0, Tave(itile)+273.15 );
+
+		cout << " After wait .. FF " << statusff << endl;
+
+		//Write
+		TaveK=Tave(itile)+273.15;
+		cout << "#tile=" << itile << " " << "Tave=" << Tave(itile) << " " << "TaveK=" << TaveK << endl;
+		Write(sharedata, 16, TaveK);
+		Post(smff); //unlock cc
+    	}
+	cout << "FreeFem++: fuori da ciclo di lettura transit" << endl;
+
 	//exec("sleep(100)");
 	//exec ("rm ../b2mn.exe.dir/run_freefem.dat"); //questo comando fa partire l'iterazione successiva in SOLPS-ITER
         /*{ // open fromfreef.dat in local folder
@@ -1864,12 +1933,15 @@ while (itruetrans==1) //cgfn con questa condizione mi assicuro che il ciclo riso
 		     fftrans1 << time << "\t" << Tave(itile)+273.15 << "\t" << qpls(itile)  << "\t" << int1d(block,CLM)(mev)/int1d(block,CLM)(1.0) << "\t" << int1d(block,CLM)(mev) << endl;
 	}//close file for output and for loop
 	*/
-	exec("sleep 0.05");
-    exec ("rm ./exchange/run_freefem.dat"); //questo comando fa partire l'iterazione successiva in SOLPS-ITER
+	//exec("sleep 0.05");
+    //exec ("rm ./exchange/run_freefem.dat"); //questo comando fa partire l'iterazione successiva in SOLPS-ITER
 
     ifirstcall=0;
 
 } // while (itruetrans==1) 
+
+Post(smff); // wait from cint
+cout << " End FreeFEM " << endl;
 
 cout << "FreeFem++ calculation completed" << endl << endl;
 //cout << "Maximum CPS temperature is " << TCMAX << " C at cut number " << ICMAX << endl;
